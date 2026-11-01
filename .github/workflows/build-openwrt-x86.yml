@@ -1,4 +1,4 @@
-name: Build OpenWrt x86_64（雷神加速器就绪 · eBPF/BTF）
+name: Build OpenWrt x86_64（雷神加速器 + dae 就绪 · eBPF/BTF）
 
 on:
   workflow_dispatch:
@@ -34,18 +34,38 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
 
-      - name: 安装编译依赖（含 pahole/dwarves，BTF 生成需要）
+      - name: 安装编译依赖（含新版 dwarves，BTF 生成需要）
         run: |
           sudo apt-get -qq update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-dev python3-setuptools \
             python3-pip rsync swig unzip zlib1g-dev file wget time bc ccache \
-            libelf-dev liblzma-dev zstd pigz pbzip2 xsltproc help2man pkg-config \
-            texinfo subversion dwarves
+            libelf-dev libdw-dev liblzma-dev zstd pigz pbzip2 xsltproc help2man pkg-config \
+            texinfo subversion cmake
           # 以下为增强项，个别装不上不影响 x86 编译
           sudo apt-get install -y --no-install-recommends \
             binutils-gold meson ninja-build mold mtd-utils u-boot-tools libbsd-dev xxd ecj fastjar || true
+
+          # ============================================================
+          # dwarves 源码编译安装（不要用 apt 的 dwarves！）
+          # Ubuntu 24.04 apt 源里的 pahole 是 1.25，解析不了 6.12 内核的
+          # DWARF5，会导致 CONFIG_DEBUG_INFO_BTF 被内核静默降级——
+          # .config 里写着 =y，但产物 vmlinux 根本没有 .BTF section。
+          # 必须 >= 1.27（此处装 1.32）才能真正生成 BTF。
+          # ============================================================
+          echo "==== 编译安装 dwarves 1.32 ===="
+          cd /tmp
+          wget -q https://github.com/acmel/dwarves/archive/refs/tags/v1.32.tar.gz -O dwarves-1.32.tar.gz
+          tar xf dwarves-1.32.tar.gz
+          cd dwarves-1.32
+          mkdir -p build && cd build
+          cmake -D__LIB=lib .. >/dev/null
+          make -j"$(nproc)" >/dev/null
+          sudo make install >/dev/null
+          sudo ldconfig
+          which pahole
+          pahole --version
 
       - name: 克隆 OpenWrt 源码
         run: |
@@ -79,7 +99,7 @@ jobs:
 
           # ---- 雷神加速器插件运行时依赖（官方帮助中心 + 社区教程核对）----
           CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_libpcap=y
+          CONFIG_PACKAGE_libpcap1=y
           CONFIG_PACKAGE_ip-full=y
           CONFIG_PACKAGE_tc-full=y
           CONFIG_PACKAGE_kmod-netem=y
@@ -97,6 +117,14 @@ jobs:
           CONFIG_PACKAGE_miniupnpd-iptables=y
           CONFIG_PACKAGE_luci-app-upnp=y
 
+          # ---- dae（eBPF 透明代理）运行时内核模块 ----
+          # dae/daed 二进制需从第三方 feed 安装（kenzok8/openwrt-daede），
+          # 但其依赖的内核模块进固件，刷机后只差二进制本身。
+          CONFIG_PACKAGE_kmod-sched-core=y
+          CONFIG_PACKAGE_kmod-sched-bpf=y
+          CONFIG_PACKAGE_kmod-veth=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+
           # ---- iptables 兼容层（雷神插件只识别 iptables 命令行）----
           # 25.12 起 iptables 已拆包：xtables-legacy 是 legacy 用户态；
           # iptables-zz-legacy 通过 update-alternatives 把 /usr/sbin/iptables
@@ -107,14 +135,18 @@ jobs:
           CONFIG_PACKAGE_iptables-zz-legacy=y
           CONFIG_PACKAGE_ip6tables-zz-legacy=y
 
-          # ---- 内核：eBPF + BTF ----
+          # ---- 内核：eBPF + BTF（dae 运行前提）----
           # 注意1：KERNEL_DEBUG_INFO_REDUCED 默认为 y，会挡住 BTF，必须显式关闭；
-          # 注意2：BTF 生成依赖宿主机 pahole（依赖步骤已装 dwarves 包）；
-          # x86 目标默认自带 CONFIG_DEBUG_INFO=y，满足 BTF 前置条件。
+          # 注意2：BTF 生成依赖宿主机 pahole >= 1.27（依赖步骤已源码编译 1.32），
+          #        apt 源的 1.25 会让 BTF 被静默降级——所以有了产物级硬验证步骤；
+          # 注意3：不开 BTF_MODULES——体积暴涨且非必需，dae 只用 vmlinux 的 BTF。
           CONFIG_KERNEL_DEBUG_INFO=y
           CONFIG_KERNEL_DEBUG_INFO_BTF=y
-          CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
           CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
+          # dae 的 eBPF 程序挂载所需（cgroup skb / XDP sockets）
+          CONFIG_KERNEL_CGROUPS=y
+          CONFIG_KERNEL_CGROUP_BPF=y
+          CONFIG_KERNEL_XDP_SOCKETS=y
           CONFIG_KERNEL_BPF_EVENTS=y
           CONFIG_KERNEL_KPROBES=y
           CONFIG_KERNEL_FTRACE_SYSCALLS=y
@@ -130,7 +162,7 @@ jobs:
           CONFIG_EOF
           make defconfig
           echo "=== 关键配置自检 ==="
-          grep -E "CONFIG_(TARGET_x86_64_DEVICE_generic|PACKAGE_iptables-zz-legacy|PACKAGE_xtables-legacy|PACKAGE_iptables-mod-tproxy|PACKAGE_kmod-ipt-tproxy|PACKAGE_kmod-ipt-ipset|PACKAGE_ipset|PACKAGE_miniupnpd-iptables|PACKAGE_luci-app-upnp|PACKAGE_bpftool-full|PACKAGE_curl|PACKAGE_libpcap|PACKAGE_ip-full|PACKAGE_tc-full|PACKAGE_kmod-netem|PACKAGE_kmod-tun|KERNEL_DEBUG_INFO_BTF|KERNEL_DEBUG_INFO_REDUCED)=" .config || true
+          grep -E "CONFIG_(TARGET_x86_64_DEVICE_generic|PACKAGE_iptables-zz-legacy|PACKAGE_xtables-legacy|PACKAGE_iptables-mod-tproxy|PACKAGE_kmod-ipt-tproxy|PACKAGE_kmod-ipt-ipset|PACKAGE_ipset|PACKAGE_miniupnpd-iptables|PACKAGE_luci-app-upnp|PACKAGE_bpftool-full|PACKAGE_curl|PACKAGE_libpcap1|PACKAGE_ip-full|PACKAGE_tc-full|PACKAGE_kmod-netem|PACKAGE_kmod-tun|PACKAGE_kmod-sched-core|PACKAGE_kmod-sched-bpf|PACKAGE_kmod-veth|PACKAGE_kmod-nft-tproxy|KERNEL_DEBUG_INFO_BTF|KERNEL_DEBUG_INFO_REDUCED|KERNEL_CGROUP_BPF|KERNEL_XDP_SOCKETS)=" .config || true
 
       - name: 追加内核 eBPF 选项（target config 兜底）
         run: |
@@ -153,6 +185,10 @@ jobs:
           CONFIG_NET_CLS_BPF=y
           CONFIG_NET_ACT_BPF=y
           CONFIG_NETFILTER_XT_MATCH_BPF=y
+          # dae 的 cgroup skb / XDP sockets 依赖（25.12 generic 默认未开）
+          CONFIG_CGROUPS=y
+          CONFIG_CGROUP_BPF=y
+          CONFIG_XDP_SOCKETS=y
           # 追踪/探针（bpftrace、uprobe 等场景需要）
           CONFIG_KPROBES=y
           CONFIG_KPROBE_EVENTS=y
@@ -161,9 +197,9 @@ jobs:
           CONFIG_FTRACE_SYSCALLS=y
           CONFIG_DYNAMIC_FTRACE=y
           # BTF（与 .config 中 CONFIG_KERNEL_DEBUG_INFO_BTF 双保险）
+          # 不开 BTF_MODULES：体积大且非必需
           CONFIG_DEBUG_INFO=y
           CONFIG_DEBUG_INFO_BTF=y
-          CONFIG_DEBUG_INFO_BTF_MODULES=y
           # 便于在路由器上核对内核实际配置：cat /proc/config.gz
           CONFIG_IKCONFIG=y
           CONFIG_IKCONFIG_PROC=y
@@ -183,14 +219,26 @@ jobs:
           # 失败时自动以单线程详细模式重跑一次，便于在日志里定位报错
           make -j"$(nproc)" || make -j1 V=s
 
-      - name: 验证 eBPF/BTF 与 TPROXY 已进入内核配置
+      - name: 硬验证：产物内核必须含 BTF（dae 运行前提，失败即阻断）
         run: |
           cd openwrt
-          for f in build_dir/target*/linux-*/linux-*/.config; do
-            [ -f "$f" ] || continue
-            echo "== $f"
-            grep -E "^CONFIG_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|IKCONFIG|IKCONFIG_PROC|NETFILTER_XT_TARGET_TPROXY|NF_TPROXY_IPV4|NETFILTER_XT_MATCH_BPF|KPROBES|UPROBES)=" "$f" || echo "（未匹配到）"
-          done
+          VMLINUX=$(ls -1 build_dir/target-*/linux-*/vmlinux 2>/dev/null | head -1)
+          if [ -z "$VMLINUX" ]; then
+            echo "::error::未找到 vmlinux 产物，内核可能没编译"
+            exit 1
+          fi
+          echo "== 检查产物内核：$VMLINUX =="
+          if readelf -S "$VMLINUX" | grep -q '\.BTF'; then
+            echo "OK: 内核含 .BTF section，dae 的 eBPF CO-RE 可用"
+            readelf -S "$VMLINUX" | grep '\.BTF'
+          else
+            echo "::error::产物内核没有 .BTF section！pahole 版本不足或 DEBUG_INFO_BTF 被降级，dae 将无法运行"
+            exit 1
+          fi
+          # 附带打印内核最终 .config 中的关键项，便于核对
+          KCONFIG=$(dirname "$VMLINUX")/.config
+          echo "== 内核 .config 关键项 =="
+          grep -E "^CONFIG_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|DEBUG_INFO_BTF|CGROUPS|CGROUP_BPF|BPF_EVENTS|XDP_SOCKETS|IKCONFIG_PROC)=" "$KCONFIG" || echo "（未匹配到）"
 
       - name: 整理产物信息
         run: |
