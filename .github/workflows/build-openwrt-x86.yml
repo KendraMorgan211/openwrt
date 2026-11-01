@@ -1,0 +1,212 @@
+name: Build OpenWrt x86_64（雷神加速器就绪 · eBPF/BTF）
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_branch:
+        description: "OpenWrt 分支（openwrt-25.12 为当前最新稳定版）"
+        required: false
+        default: openwrt-25.12
+        type: choice
+        options:
+          - openwrt-25.12
+          - openwrt-24.10
+          - master
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-openwrt-x86.yml"]
+  schedule:
+    - cron: "0 10 * * 6" # 每周六 18:00（北京时间）自动构建
+
+env:
+  TZ: Asia/Shanghai
+  OPENWRT_BRANCH: ${{ github.event.inputs.openwrt_branch || 'openwrt-25.12' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - name: 安装编译依赖（含 pahole/dwarves，BTF 生成需要）
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-dev python3-setuptools \
+            python3-pip rsync swig unzip zlib1g-dev file wget time bc ccache \
+            libelf-dev liblzma-dev zstd pigz pbzip2 xsltproc help2man pkg-config \
+            texinfo subversion dwarves
+          # 以下为增强项，个别装不上不影响 x86 编译
+          sudo apt-get install -y --no-install-recommends \
+            binutils-gold meson ninja-build mold mtd-utils u-boot-tools libbsd-dev xxd ecj fastjar || true
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          git clone --depth 1 -b "$OPENWRT_BRANCH" https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          echo "分支：$OPENWRT_BRANCH"
+          git log -1 --format="提交：%h %ci %s"
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 写入 .config（x86_64 + LuCI + iptables 兼容层 + eBPF/BTF）
+        run: |
+          cd openwrt
+          cat > .config <<'CONFIG_EOF'
+          # ============================================================
+          # OpenWrt x86_64（generic）· 雷神加速器就绪 · eBPF/BTF
+          # ============================================================
+          # ---- 目标平台 ----
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+          # ---- LuCI 与中文界面 ----
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+
+          # ---- 雷神加速器插件运行时依赖（官方帮助中心 + 社区教程核对）----
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_libpcap=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_tc-full=y
+          CONFIG_PACKAGE_kmod-netem=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-ipt-nat=y
+          CONFIG_PACKAGE_kmod-ipt-tproxy=y
+          CONFIG_PACKAGE_kmod-ipt-ipset=y
+          CONFIG_PACKAGE_ipset=y
+          CONFIG_PACKAGE_iptables-mod-tproxy=y
+          CONFIG_PACKAGE_iptables-mod-nat-extra=y
+          CONFIG_PACKAGE_iptables-mod-conntrack-extra=y
+          CONFIG_PACKAGE_iptables-mod-iprange=y
+          CONFIG_PACKAGE_iptables-mod-hashlimit=y
+          CONFIG_PACKAGE_iptables-mod-u32=y
+          CONFIG_PACKAGE_miniupnpd-iptables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+
+          # ---- iptables 兼容层（雷神插件只识别 iptables 命令行）----
+          # 25.12 起 iptables 已拆包：xtables-legacy 是 legacy 用户态；
+          # iptables-zz-legacy 通过 update-alternatives 把 /usr/sbin/iptables
+          # 指向 legacy（PROVIDES:=iptables iptables-legacy）。
+          # 切勿安装 iptables-nft：其 alternatives 优先级(300)高于 zz-legacy(200)，
+          # 会把 iptables 命令抢回 nft 实现，插件可能不识别。
+          CONFIG_PACKAGE_xtables-legacy=y
+          CONFIG_PACKAGE_iptables-zz-legacy=y
+          CONFIG_PACKAGE_ip6tables-zz-legacy=y
+
+          # ---- 内核：eBPF + BTF ----
+          # 注意1：KERNEL_DEBUG_INFO_REDUCED 默认为 y，会挡住 BTF，必须显式关闭；
+          # 注意2：BTF 生成依赖宿主机 pahole（依赖步骤已装 dwarves 包）；
+          # x86 目标默认自带 CONFIG_DEBUG_INFO=y，满足 BTF 前置条件。
+          CONFIG_KERNEL_DEBUG_INFO=y
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
+          CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
+          CONFIG_KERNEL_BPF_EVENTS=y
+          CONFIG_KERNEL_KPROBES=y
+          CONFIG_KERNEL_FTRACE_SYSCALLS=y
+          CONFIG_KERNEL_DYNAMIC_FTRACE=y
+
+          # ---- eBPF 用户态工具 ----
+          CONFIG_PACKAGE_bpftool-full=y
+
+          # ---- 可选：整体切换到 fw3（纯 iptables 防火墙，对老插件兼容性最好）----
+          # 与 firewall4 冲突，二者只能留一个；默认方案是 fw4 + 上面的 iptables 兼容层
+          # CONFIG_PACKAGE_firewall=y
+          # CONFIG_PACKAGE_firewall4 is not set
+          CONFIG_EOF
+          make defconfig
+          echo "=== 关键配置自检 ==="
+          grep -E "CONFIG_(TARGET_x86_64_DEVICE_generic|PACKAGE_iptables-zz-legacy|PACKAGE_xtables-legacy|PACKAGE_iptables-mod-tproxy|PACKAGE_kmod-ipt-tproxy|PACKAGE_kmod-ipt-ipset|PACKAGE_ipset|PACKAGE_miniupnpd-iptables|PACKAGE_luci-app-upnp|PACKAGE_bpftool-full|PACKAGE_curl|PACKAGE_libpcap|PACKAGE_ip-full|PACKAGE_tc-full|PACKAGE_kmod-netem|PACKAGE_kmod-tun|KERNEL_DEBUG_INFO_BTF|KERNEL_DEBUG_INFO_REDUCED)=" .config || true
+
+      - name: 追加内核 eBPF 选项（target config 兜底）
+        run: |
+          cd openwrt
+          for f in target/linux/x86/config-* target/linux/x86/*/config-*; do
+            [ -f "$f" ] || continue
+            grep -q "eBPF/BTF custom block" "$f" 2>/dev/null && continue
+            cat >> "$f" <<'KERNEL_EOF'
+          # ==== eBPF/BTF custom block（GitHub Actions 追加，请勿手改）====
+          # eBPF 子系统（25.12 generic 配置已默认开 BPF_SYSCALL/JIT，此处显式加固）
+          CONFIG_BPF_SYSCALL=y
+          CONFIG_BPF_JIT=y
+          CONFIG_BPF_JIT_ALWAYS_ON=y
+          CONFIG_BPF_JIT_DEFAULT_ON=y
+          CONFIG_HAVE_EBPF_JIT=y
+          CONFIG_BPF_EVENTS=y
+          CONFIG_BPF_STREAM_PARSER=y
+          CONFIG_LWTUNNEL=y
+          CONFIG_LWTUNNEL_BPF=y
+          CONFIG_NET_CLS_BPF=y
+          CONFIG_NET_ACT_BPF=y
+          CONFIG_NETFILTER_XT_MATCH_BPF=y
+          # 追踪/探针（bpftrace、uprobe 等场景需要）
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_UPROBES=y
+          CONFIG_UPROBE_EVENTS=y
+          CONFIG_FTRACE_SYSCALLS=y
+          CONFIG_DYNAMIC_FTRACE=y
+          # BTF（与 .config 中 CONFIG_KERNEL_DEBUG_INFO_BTF 双保险）
+          CONFIG_DEBUG_INFO=y
+          CONFIG_DEBUG_INFO_BTF=y
+          CONFIG_DEBUG_INFO_BTF_MODULES=y
+          # 便于在路由器上核对内核实际配置：cat /proc/config.gz
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
+          KERNEL_EOF
+          done
+          echo "已追加的配置文件："
+          ls -1 target/linux/x86/config-* target/linux/x86/*/config-* 2>/dev/null || true
+
+      - name: 预下载源码
+        run: |
+          cd openwrt
+          make download -j"$(nproc)"
+
+      - name: 编译固件（x86_64 约 40-80 分钟）
+        run: |
+          cd openwrt
+          # 失败时自动以单线程详细模式重跑一次，便于在日志里定位报错
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: 验证 eBPF/BTF 与 TPROXY 已进入内核配置
+        run: |
+          cd openwrt
+          for f in build_dir/target*/linux-*/linux-*/.config; do
+            [ -f "$f" ] || continue
+            echo "== $f"
+            grep -E "^CONFIG_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|IKCONFIG|IKCONFIG_PROC|NETFILTER_XT_TARGET_TPROXY|NF_TPROXY_IPV4|NETFILTER_XT_MATCH_BPF|KPROBES|UPROBES)=" "$f" || echo "（未匹配到）"
+          done
+
+      - name: 整理产物信息
+        run: |
+          cd openwrt/bin/targets/x86/64
+          {
+            echo "OpenWrt 分支：$OPENWRT_BRANCH"
+            echo "构建时间：$(date '+%F %T %z')"
+            echo "Actions run：$GITHUB_RUN_NUMBER / $GITHUB_SHA"
+          } > build-info.txt
+          ls -lh
+
+      - name: 上传固件 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86-64
+          path: openwrt/bin/targets/x86/64/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
