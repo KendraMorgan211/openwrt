@@ -34,6 +34,20 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
 
+      - name: 配置 swap（BTF 生成防 OOM）
+        run: |
+          # 开启完整 debug info 后，pahole 为 vmlinux 生成 .BTF 时内存占用可达数 GB；
+          # runner 默认 16GB 内存，与其他编译任务叠加可能触发 OOM kill，
+          # 导致内核链接产物处于损坏/不完整状态。加 8G swap 作为保险。
+          if ! sudo swapon --show | grep -q swapfile; then
+            sudo fallocate -l 8G /swapfile 2>/dev/null || \
+              sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile || echo "::warning::swap 启用失败（不阻断构建）"
+          fi
+          free -h
+
       - name: 安装编译依赖（含新版 dwarves，BTF 生成需要）
         run: |
           sudo apt-get -qq update
@@ -225,29 +239,83 @@ jobs:
       - name: 编译固件（x86_64 约 40-80 分钟）
         run: |
           cd openwrt
-          # 失败时自动以单线程详细模式重跑一次，便于在日志里定位报错
-          make -j"$(nproc)" || make -j1 V=s
+          echo "=== 编译前资源 ==="
+          df -h / | tail -1
+          free -h | head -2
+          # 失败重试前必须先删除内核链接产物（vmlinux/vmlinux.o/.image 等）。
+          # 否则 make 会因目标文件时间戳较新而跳过重新链接，可能带着损坏或
+          # 缺失的内核产物"成功"结束整个构建——BTF 硬验证必须拦停这种情况。
+          if ! make -j"$(nproc)"; then
+            echo "::warning::并行编译失败，清理内核链接产物后以单线程详细模式重试"
+            rm -f build_dir/target-*/linux-*/vmlinux \
+                  build_dir/target-*/linux-*/vmlinux.o \
+                  build_dir/target-*/linux-*/System.map \
+                  build_dir/target-*/linux-*/.tmp_vmlinux* \
+                  build_dir/target-*/linux-*/.image \
+                  build_dir/target-*/linux-*/symtab.h 2>/dev/null || true
+            make -j1 V=s
+          fi
+          echo "=== 编译后资源 ==="
+          df -h / | tail -1
+          free -h | head -2
 
       - name: 硬验证：产物内核必须含 BTF（dae 运行前提，失败即阻断）
         run: |
           cd openwrt
-          VMLINUX=$(ls -1 build_dir/target-*/linux-*/vmlinux 2>/dev/null | head -1)
+          KDIR=$(ls -d build_dir/target-*/linux-*/ 2>/dev/null | head -1)
+          echo "== 内核构建目录: $KDIR =="
+          echo "== 目录内容（前 40 项）=="
+          ls -la "$KDIR" 2>/dev/null | head -40
+
+          echo "== 内核构建目录下所有 vmlinux* 文件及真实类型 =="
+          for f in "$KDIR"/vmlinux*; do
+            [ -e "$f" ] || continue
+            printf '%s\n   => ' "$f"
+            file -b "$f" 2>/dev/null || echo "(file 命令失败)"
+            echo "   前 16 字节: $(od -A n -t x1 -N 16 "$f" 2>/dev/null | tr -d '\n')"
+          done
+
+          echo "== CopyImage 快照（build_dir/target-*/vmlinux*）=="
+          for f in build_dir/target-*/vmlinux*; do
+            [ -e "$f" ] || continue
+            printf '%s\n   => ' "$f"
+            file -b "$f" 2>/dev/null || echo "(file 命令失败)"
+          done
+
+          # 选取待检内核：优先内核构建目录的 vmlinux；若它已损坏（非 ELF），
+          # 退而检查 CopyImage 的 .debug 快照（与打进固件的 bzImage 同源，
+          # 可用于判断固件内核是否真的缺 BTF）
+          PRIMARY="$KDIR/vmlinux"
+          VMLINUX=""
+          for cand in "$PRIMARY" build_dir/target-*/vmlinux.debug build_dir/target-*/vmlinux.elf; do
+            [ -f "$cand" ] || continue
+            if file -b "$cand" 2>/dev/null | grep -q ELF; then VMLINUX="$cand"; break; fi
+          done
+
           if [ -z "$VMLINUX" ]; then
-            echo "::error::未找到 vmlinux 产物，内核可能没编译"
+            echo "::error::未找到任何 ELF 格式的内核产物（vmlinux / vmlinux.debug / vmlinux.elf），内核未正确编译"
             exit 1
           fi
-          echo "== 检查产物内核：$VMLINUX =="
-          if readelf -S "$VMLINUX" | grep -q '\.BTF'; then
-            echo "OK: 内核含 .BTF section，dae 的 eBPF CO-RE 可用"
-            readelf -S "$VMLINUX" | grep '\.BTF'
+          if [ "$VMLINUX" != "$PRIMARY" ]; then
+            echo "::warning::内核构建目录的 vmlinux 不是有效 ELF（见上方文件类型输出），已退用快照 $VMLINUX 验证 BTF"
+          fi
+
+          echo "== 检查产物内核: $VMLINUX =="
+          SECT=$(readelf -S "$VMLINUX" 2>&1)
+          echo "$SECT" | grep -E '\.BTF|\.debug_info' || echo "(未发现 .BTF / .debug_info section)"
+          if echo "$SECT" | grep -q '\.BTF'; then
+            echo "OK: $VMLINUX 含 .BTF section，dae 的 eBPF CO-RE 可用"
           else
-            echo "::error::产物内核没有 .BTF section！pahole 版本不足或 DEBUG_INFO_BTF 被降级，dae 将无法运行"
+            echo "::error::$VMLINUX 没有 .BTF section！pahole 未生效（版本不足/被 OOM kill/DEBUG_INFO_BTF 被降级），dae 将无法运行"
             exit 1
           fi
-          # 附带打印内核最终 .config 中的关键项，便于核对
-          KCONFIG=$(dirname "$VMLINUX")/.config
+
+          # 附带打印内核最终 .config 关键项与宿主机 pahole 版本，便于核对
+          KCONFIG="$KDIR/.config"
           echo "== 内核 .config 关键项 =="
-          grep -E "^CONFIG_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|DEBUG_INFO_BTF|CGROUPS|CGROUP_BPF|BPF_EVENTS|XDP_SOCKETS|IKCONFIG_PROC)=" "$KCONFIG" || echo "（未匹配到）"
+          grep -E "^CONFIG_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|CGROUPS|CGROUP_BPF|BPF_EVENTS|XDP_SOCKETS|IKCONFIG_PROC|KALLSYMS)=" "$KCONFIG" 2>/dev/null || echo "（未匹配到）"
+          echo "== 宿主机 pahole 版本 =="
+          pahole --version || true
 
       - name: 整理产物信息
         run: |
