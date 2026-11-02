@@ -54,16 +54,25 @@ jobs:
           # .config 里写着 =y，但产物 vmlinux 根本没有 .BTF section。
           # 必须 >= 1.27（此处装 1.32）才能真正生成 BTF。
           # ============================================================
-          echo "==== 编译安装 dwarves 1.32 ===="
+          echo "==== 编译安装 dwarves 1.32（git clone + libbpf 子模块）===="
           cd /tmp
-          wget -q https://github.com/acmel/dwarves/archive/refs/tags/v1.32.tar.gz -O dwarves-1.32.tar.gz
-          tar xf dwarves-1.32.tar.gz
-          cd dwarves-1.32
+          rm -rf dwarves
+          # 必须 git clone --recurse-submodules，不能下载 GitHub 源码 tarball：
+          # archive/refs/tags/*.tar.gz 不含子模块内容，而 dwarves 1.32 内嵌
+          # libbpf 子模块（lib/bpf），缺失时 CMakeLists.txt 第 87 行直接
+          # FATAL_ERROR "The submodules were not downloaded!"。
+          git clone --depth 1 --branch v1.32 --recurse-submodules --shallow-submodules \
+            https://github.com/acmel/dwarves.git dwarves
+          cd dwarves
+          # 双保险：确保 lib/bpf 子模块真的就位（缺 btf.h 说明子模块没拉到）
+          git submodule update --init --recursive --depth 1
+          test -f lib/bpf/src/btf.h && echo "libbpf 子模块就位" || { echo "FATAL: libbpf 子模块缺失"; exit 1; }
           mkdir -p build && cd build
-          cmake -D__LIB=lib .. >/dev/null
-          make -j"$(nproc)" >/dev/null
-          sudo make install >/dev/null
+          cmake -D__LIB=lib ..
+          make -j"$(nproc)"
+          sudo make install
           sudo ldconfig
+          hash -r
           which pahole
           pahole --version
 
